@@ -89,7 +89,7 @@ async def register(req: RegisterReq):
     USERS[req.email] = {
         "id": user_id,
         "email": req.email,
-        "password_hash": pwd_context.hash(req.password),
+        "password_hash": pwd_context.hash(req.password[:72]),
         "credits": SIGNUP_BONUS,
         "api_key": api_key,
         "plan": "Free",
@@ -122,7 +122,7 @@ async def register(req: RegisterReq):
 @app.post("/v1/auth/login")
 async def login(req: LoginReq):
     user = USERS.get(req.email)
-    if not user or not pwd_context.verify(req.password, user["password_hash"]):
+    if not user or not pwd_context.verify(req.password[:72], user["password_hash"]):
         raise HTTPException(401, "Invalid credentials")
 
     today = datetime.utcnow().date().isoformat()
