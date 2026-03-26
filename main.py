@@ -1,5 +1,6 @@
 """
-ChartPulse AI — Backend API with Supabase Database
+ChartPulse AI — Backend API v3
+Pricing: Free (3 total), Starter $39/mo (5/day), Pro $79/mo (10/day)
 """
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -19,27 +20,27 @@ STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
 
-app = FastAPI(title="ChartPulse AI API", version="2.0.0")
+app = FastAPI(title="ChartPulse AI API", version="3.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
+
+# ─── Plan Config ──────────────────────────────────────────
+PLAN_CONFIG = {
+    "Free": {"daily_limit": 0, "total_limit": 3, "max_strategies": 3, "personas": ["intraday"], "languages": ["en"], "history_limit": 5, "strategy_breakdown": False},
+    "Starter": {"daily_limit": 5, "total_limit": 0, "max_strategies": 10, "personas": ["scalper","intraday","swing","position"], "languages": ["en","ar"], "history_limit": 0, "strategy_breakdown": False},
+    "Pro": {"daily_limit": 10, "total_limit": 0, "max_strategies": 10, "personas": ["scalper","intraday","swing","position"], "languages": ["en","ar"], "history_limit": 0, "strategy_breakdown": True},
+}
 
 async def sb(method, table, data=None, params=None):
     url = f"{SUPABASE_URL}/rest/v1/{table}"
     headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}", "Content-Type": "application/json", "Prefer": "return=representation"}
     async with httpx.AsyncClient(timeout=15) as client:
-        if method == "GET":
-            r = await client.get(url, headers=headers, params=params or {})
-        elif method == "POST":
-            r = await client.post(url, headers=headers, json=data)
-        elif method == "PATCH":
-            r = await client.patch(url, headers=headers, json=data, params=params or {})
-        else:
-            raise ValueError(f"Unknown method: {method}")
-    if r.status_code >= 400:
-        raise ValueError(f"Supabase error {r.status_code}: {r.text[:300]}")
-    try:
-        return r.json()
-    except:
-        return None
+        if method == "GET": r = await client.get(url, headers=headers, params=params or {})
+        elif method == "POST": r = await client.post(url, headers=headers, json=data)
+        elif method == "PATCH": r = await client.patch(url, headers=headers, json=data, params=params or {})
+        else: raise ValueError(f"Unknown: {method}")
+    if r.status_code >= 400: raise ValueError(f"Supabase {r.status_code}: {r.text[:300]}")
+    try: return r.json()
+    except: return None
 
 def hash_password(pw):
     salt = secrets.token_hex(16)
@@ -54,30 +55,35 @@ def create_token(uid):
 
 async def get_current_user(request: Request):
     auth = request.headers.get("Authorization", "")
-    if not auth.startswith("Bearer "):
-        raise HTTPException(401, "Missing token")
-    try:
-        uid = jwt.decode(auth[7:], SECRET_KEY, algorithms=["HS256"]).get("sub")
-    except:
-        raise HTTPException(401, "Invalid token")
+    if not auth.startswith("Bearer "): raise HTTPException(401, "Missing token")
+    try: uid = jwt.decode(auth[7:], SECRET_KEY, algorithms=["HS256"]).get("sub")
+    except: raise HTTPException(401, "Invalid token")
     rows = await sb("GET", "users", params={"id": f"eq.{uid}", "select": "*"})
-    if not rows:
-        raise HTTPException(401, "User not found")
+    if not rows: raise HTTPException(401, "User not found")
     return rows[0]
 
 async def detect_country(request: Request):
     ip = request.headers.get("X-Forwarded-For", request.client.host)
-    if ip and "," in ip:
-        ip = ip.split(",")[0].strip()
+    if ip and "," in ip: ip = ip.split(",")[0].strip()
     try:
         async with httpx.AsyncClient(timeout=5) as c:
             r = await c.get(f"http://ip-api.com/json/{ip}?fields=country,countryCode")
             if r.status_code == 200:
                 d = r.json()
                 return d.get("country", "Unknown"), d.get("countryCode", "")
-    except:
-        pass
+    except: pass
     return "Unknown", ""
+
+def get_plan_config(user):
+    plan = user.get("plan", "Free")
+    # Check expiry
+    expires = user.get("plan_expires")
+    if expires and plan != "Free":
+        try:
+            if datetime.fromisoformat(expires) < datetime.utcnow():
+                plan = "Free"
+        except: pass
+    return plan, PLAN_CONFIG.get(plan, PLAN_CONFIG["Free"])
 
 class RegisterReq(BaseModel):
     email: EmailStr
@@ -98,68 +104,89 @@ class AnalyzeReq(BaseModel):
 class SubscribeReq(BaseModel):
     plan: str
 
+
+# ─── Auth ─────────────────────────────────────────────────
 @app.post("/v1/auth/register")
 async def register(req: RegisterReq, request: Request):
     existing = await sb("GET", "users", params={"email": f"eq.{req.email}", "select": "id"})
-    if existing:
-        raise HTTPException(400, "Email already registered")
-    country = req.country or ""
-    country_code = ""
-    if not country:
-        country, country_code = await detect_country(request)
-    user_id = secrets.token_hex(16)
-    await sb("POST", "users", {"id": user_id, "email": req.email, "password_hash": hash_password(req.password), "phone": req.phone or "", "country": country, "country_code": country_code, "plan": "Free", "daily_limit": 5, "plan_expires": None, "created_at": datetime.utcnow().isoformat()})
-    return {"token": create_token(user_id), "user": {"id": user_id, "email": req.email, "plan": "Free", "daily_limit": 5, "analyses_remaining": 5}}
+    if existing: raise HTTPException(400, "Email already registered")
+    country, cc = req.country or "", ""
+    if not country: country, cc = await detect_country(request)
+    uid = secrets.token_hex(16)
+    await sb("POST", "users", {"id": uid, "email": req.email, "password_hash": hash_password(req.password), "phone": req.phone or "", "country": country, "country_code": cc, "plan": "Free", "daily_limit": 3, "plan_expires": None, "created_at": datetime.utcnow().isoformat()})
+    return {"token": create_token(uid), "user": {"id": uid, "email": req.email, "plan": "Free", "signals_left": 3, "plan_config": PLAN_CONFIG["Free"]}}
 
 @app.post("/v1/auth/login")
 async def login(req: LoginReq):
     rows = await sb("GET", "users", params={"email": f"eq.{req.email}", "select": "*"})
-    if not rows or not verify_password(req.password, rows[0]["password_hash"]):
-        raise HTTPException(401, "Invalid credentials")
+    if not rows or not verify_password(req.password, rows[0]["password_hash"]): raise HTTPException(401, "Invalid credentials")
     user = rows[0]
-    today = datetime.utcnow().date().isoformat()
-    analyses = await sb("GET", "analyses", params={"user_id": f"eq.{user['id']}", "created_at": f"gte.{today}T00:00:00", "select": "id"})
-    remaining = max(0, (user.get("daily_limit") or 5) - (len(analyses) if analyses else 0))
-    return {"token": create_token(user["id"]), "user": {"id": user["id"], "email": user["email"], "plan": user.get("plan", "Free"), "daily_limit": user.get("daily_limit", 5), "analyses_remaining": remaining}}
+    plan, cfg = get_plan_config(user)
+    signals_left = await calc_signals_left(user, plan, cfg)
+    return {"token": create_token(user["id"]), "user": {"id": user["id"], "email": user["email"], "plan": plan, "signals_left": signals_left, "plan_config": cfg}}
 
+async def calc_signals_left(user, plan, cfg):
+    all_analyses = await sb("GET", "analyses", params={"user_id": f"eq.{user['id']}", "select": "id,created_at"})
+    total = len(all_analyses) if all_analyses else 0
+    if plan == "Free":
+        return max(0, cfg["total_limit"] - total)
+    else:
+        today = datetime.utcnow().date().isoformat()
+        today_count = sum(1 for a in (all_analyses or []) if a.get("created_at","").startswith(today))
+        return max(0, cfg["daily_limit"] - today_count)
+
+
+# ─── Analyze ──────────────────────────────────────────────
 STRATEGY_PROMPTS = {"price_action": "Analyze using pure price action: candlestick patterns, market structure, trend direction, key swing levels.", "smc": "Analyze using Smart Money Concepts: order blocks, fair value gaps, liquidity sweeps, institutional order flow.", "supply_demand": "Analyze using supply and demand zones: fresh vs tested zones, zone quality, DBR/RBD.", "fibonacci": "Analyze using Fibonacci retracements (0.382, 0.5, 0.618, 0.786) and extensions.", "ema_ma": "Analyze using EMA 9/20/50/200, golden/death crosses, EMA pullbacks.", "wyckoff": "Analyze using Wyckoff: accumulation/distribution, spring/upthrust.", "elliott": "Analyze using Elliott Wave: wave count (impulse 1-5 or corrective A-B-C).", "ichimoku": "Analyze using Ichimoku: Tenkan/Kijun cross, cloud position, Chikou span.", "volume": "Analyze using volume: spikes, VWAP, POC, high/low volume nodes.", "harmonic": "Analyze using Harmonic patterns: Gartley, Bat, Butterfly, Crab, Cypher."}
 
-def build_prompt(strategies, persona, language):
+def build_prompt(strategies, persona, language, show_breakdown):
     pm = {"scalper": "SCALPER (1m-5m, tight SL)", "intraday": "INTRADAY trader (15m-1H)", "swing": "SWING trader (4H-Daily)", "position": "POSITION trader (Daily-Weekly)"}
-    lm = {"en": "English", "ar": "Arabic", "fr": "French", "es": "Spanish", "zh": "Chinese", "tr": "Turkish"}
+    lm = {"en": "English", "ar": "Arabic"}
     st = "\n".join(f"{i+1}. {s.replace('_',' ').title()}: {STRATEGY_PROMPTS.get(s,'')}" for i, s in enumerate(strategies) if s in STRATEGY_PROMPTS)
+    breakdown = ""
+    if show_breakdown:
+        breakdown = ',"strategies":[{"name":"name","verdict":"LONG/SHORT/NEUTRAL","confidence":1-5,"key_finding":"one sentence"}]'
     return f"""You are ChartPulse AI. Analyze this chart:
 {st}
 You are analyzing for a {pm.get(persona, pm['intraday'])}.
 Respond in {lm.get(language, 'English')}.
 RESPOND ONLY IN JSON (no markdown, no backticks):
-{{"symbol":"symbol","timeframe":"tf","consensus":{{"direction":"LONG/SHORT/NO TRADE","confidence":0-100,"entry":"price","take_profit":"price","stop_loss":"price","risk_reward":"ratio"}},"strategies":[{{"name":"name","verdict":"LONG/SHORT/NEUTRAL","confidence":1-5,"key_finding":"summary"}}],"reasoning":"2-3 sentences"}}"""
+{{"symbol":"symbol","timeframe":"tf","consensus":{{"direction":"LONG/SHORT/NO TRADE","confidence":0-100,"entry":"price","take_profit":"price","stop_loss":"price","risk_reward":"ratio"}}{breakdown},"reasoning":"2-3 sentences"}}"""
 
 @app.post("/v1/analyze")
 async def analyze_chart(req: AnalyzeReq, request: Request):
     user = await get_current_user(request)
-    plan = user.get("plan", "Free")
-    dl = user.get("daily_limit") or 5
-    ms = 3 if plan == "Free" else 10
-    expires = user.get("plan_expires")
-    if expires:
-        try:
-            if datetime.fromisoformat(expires) < datetime.utcnow():
-                plan, dl, ms = "Free", 5, 3
-                await sb("PATCH", "users", {"plan": "Free", "daily_limit": 5}, params={"id": f"eq.{user['id']}"})
-        except: pass
-    today = datetime.utcnow().date().isoformat()
-    ta = await sb("GET", "analyses", params={"user_id": f"eq.{user['id']}", "created_at": f"gte.{today}T00:00:00", "select": "id"})
-    tc = len(ta) if ta else 0
-    if tc >= dl:
-        raise HTTPException(402, "Daily limit reached. Upgrade your plan.")
-    strategies = req.strategies[:ms]
-    if not strategies:
-        raise HTTPException(400, "Select at least one strategy")
-    if len(req.image_base64) < 100:
-        raise HTTPException(400, "Invalid image")
+    plan, cfg = get_plan_config(user)
+
+    # Reset expired plans
+    if plan != user.get("plan"):
+        await sb("PATCH", "users", {"plan": "Free", "daily_limit": 3}, params={"id": f"eq.{user['id']}"})
+
+    # Check signals left
+    signals_left = await calc_signals_left(user, plan, cfg)
+    if signals_left <= 0:
+        if plan == "Free":
+            raise HTTPException(402, "Your 3 free signals are used up. Upgrade to Starter for 5 signals/day.")
+        else:
+            raise HTTPException(402, f"Daily limit reached ({cfg['daily_limit']} signals). Upgrade your plan for more.")
+
+    # Enforce strategy limit
+    strategies = req.strategies[:cfg["max_strategies"]]
+    if not strategies: raise HTTPException(400, "Select at least one strategy")
+
+    # Enforce persona restriction
+    if req.persona not in cfg["personas"]:
+        req.persona = "intraday"
+
+    # Enforce language restriction
+    if req.language not in cfg["languages"]:
+        req.language = "en"
+
+    if len(req.image_base64) < 100: raise HTTPException(400, "Invalid image")
+
     start = time.time()
-    prompt = build_prompt(strategies, req.persona, req.language)
+    prompt = build_prompt(strategies, req.persona, req.language, cfg["strategy_breakdown"])
+
     result = None
     last_error = None
     for n, fn, k in [("claude", call_claude, ANTHROPIC_API_KEY), ("gemini", call_gemini, GEMINI_API_KEY), ("openai", call_openai, OPENAI_API_KEY)]:
@@ -167,20 +194,27 @@ async def analyze_chart(req: AnalyzeReq, request: Request):
         try:
             result = await fn(req.image_base64, prompt)
             break
-        except Exception as e:
-            last_error = e
-    if not result:
-        raise HTTPException(500, f"Analysis failed: {last_error}")
+        except Exception as e: last_error = e
+
+    if not result: raise HTTPException(500, f"Analysis failed: {last_error}")
+
     import re
     clean = re.sub(r'```json\s*', '', result)
     clean = re.sub(r'```\s*', '', clean).strip()
     match = re.search(r'\{[\s\S]*\}', clean)
-    if not match:
-        raise HTTPException(500, "Could not parse AI response")
+    if not match: raise HTTPException(500, "Could not parse AI response")
     analysis = json.loads(match.group(0))
     ems = int((time.time() - start) * 1000)
+
+    # If not Pro, remove strategy breakdown from response
+    if not cfg["strategy_breakdown"]:
+        analysis.pop("strategies", None)
+
     await sb("POST", "analyses", {"user_id": user["id"], "symbol": analysis.get("symbol", "?"), "direction": analysis.get("consensus", {}).get("direction", ""), "confidence": analysis.get("consensus", {}).get("confidence", 0), "timeframe": analysis.get("timeframe", ""), "entry_price": analysis.get("consensus", {}).get("entry", ""), "tp_price": analysis.get("consensus", {}).get("take_profit", ""), "sl_price": analysis.get("consensus", {}).get("stop_loss", ""), "execution_ms": ems, "created_at": datetime.utcnow().isoformat()})
-    return {"analysis": analysis, "analyses_remaining": dl - tc - 1, "plan": plan, "execution_ms": ems}
+
+    new_left = signals_left - 1
+    return {"analysis": analysis, "signals_left": new_left, "plan": plan, "execution_ms": ems}
+
 
 async def call_claude(img, prompt):
     async with httpx.AsyncClient(timeout=60) as c:
@@ -200,7 +234,12 @@ async def call_openai(img, prompt):
     if r.status_code != 200: raise ValueError(f"OpenAI {r.status_code}")
     return r.json()["choices"][0]["message"]["content"]
 
-PLANS = {"m1": {"name": "1 Month", "price_cents": 700, "months": 1, "daily_limit": 50}, "m3": {"name": "3 Months", "price_cents": 1500, "months": 3, "daily_limit": 9999}, "m6": {"name": "6 Months", "price_cents": 2400, "months": 6, "daily_limit": 9999}}
+
+# ─── Subscriptions ────────────────────────────────────────
+PLANS = {
+    "starter": {"name": "Starter", "price_cents": 3900, "months": 1, "daily_limit": 5},
+    "pro": {"name": "Pro", "price_cents": 7900, "months": 1, "daily_limit": 10},
+}
 
 @app.post("/v1/subscribe")
 async def subscribe(req: SubscribeReq, request: Request):
@@ -210,7 +249,7 @@ async def subscribe(req: SubscribeReq, request: Request):
     if not STRIPE_SECRET: raise HTTPException(500, "Payments not configured")
     import stripe
     stripe.api_key = STRIPE_SECRET
-    session = stripe.checkout.Session.create(payment_method_types=["card"], line_items=[{"price_data": {"currency": "usd", "product_data": {"name": f"ChartPulse AI - {plan['name']}"}, "unit_amount": plan["price_cents"]}, "quantity": 1}], mode="payment", success_url="http://www.khartoumbar.com/success.html", cancel_url="http://www.khartoumbar.com/dashboard.html", metadata={"user_email": user["email"], "plan_name": plan["name"], "months": str(plan["months"]), "daily_limit": str(plan["daily_limit"])})
+    session = stripe.checkout.Session.create(payment_method_types=["card"], line_items=[{"price_data": {"currency": "usd", "product_data": {"name": f"ChartPulse AI — {plan['name']}"}, "unit_amount": plan["price_cents"]}, "quantity": 1}], mode="payment", success_url="http://www.khartoumbar.com/success.html", cancel_url="http://www.khartoumbar.com/dashboard.html", metadata={"user_email": user["email"], "plan_name": plan["name"], "months": str(plan["months"]), "daily_limit": str(plan["daily_limit"])})
     return {"checkout_url": session.url}
 
 @app.post("/v1/stripe/webhook")
@@ -227,30 +266,42 @@ async def stripe_webhook(request: Request):
         if email:
             rows = await sb("GET", "users", params={"email": f"eq.{email}", "select": "id"})
             if rows:
-                await sb("PATCH", "users", {"plan": meta.get("plan_name", ""), "daily_limit": int(meta.get("daily_limit", 50)), "plan_expires": (datetime.utcnow() + timedelta(days=int(meta.get("months", 1)) * 30)).isoformat()}, params={"id": f"eq.{rows[0]['id']}"})
+                await sb("PATCH", "users", {"plan": meta.get("plan_name", ""), "daily_limit": int(meta.get("daily_limit", 5)), "plan_expires": (datetime.utcnow() + timedelta(days=int(meta.get("months", 1)) * 30)).isoformat()}, params={"id": f"eq.{rows[0]['id']}"})
     return {"received": True}
 
+
+# ─── Dashboard ────────────────────────────────────────────
 @app.get("/v1/stats")
 async def stats(request: Request):
     user = await get_current_user(request)
-    today = datetime.utcnow().date().isoformat()
-    a = await sb("GET", "analyses", params={"user_id": f"eq.{user['id']}", "created_at": f"gte.{today}T00:00:00", "select": "id"})
-    plan = user.get("plan", "Free")
+    plan, cfg = get_plan_config(user)
+    signals_left = await calc_signals_left(user, plan, cfg)
+    all_a = await sb("GET", "analyses", params={"user_id": f"eq.{user['id']}", "select": "id"})
+    total = len(all_a) if all_a else 0
     expires = user.get("plan_expires")
     es = "—"
     if expires:
         try:
             ed = datetime.fromisoformat(expires)
-            if ed < datetime.utcnow(): plan, es = "Free", "Expired"; await sb("PATCH", "users", {"plan": "Free", "daily_limit": 5}, params={"id": f"eq.{user['id']}"})
+            if ed < datetime.utcnow(): plan, es = "Free", "Expired"; await sb("PATCH", "users", {"plan": "Free", "daily_limit": 3}, params={"id": f"eq.{user['id']}"})
             else: es = ed.strftime("%b %d, %Y")
         except: pass
-    return {"total_analyses": len(a) if a else 0, "plan": plan, "expires": es, "daily_limit": user.get("daily_limit") or 5}
+    return {"plan": plan, "signals_left": signals_left, "total_analyses": total, "expires": es, "plan_config": cfg}
 
 @app.get("/v1/user/history")
 async def history(request: Request):
     user = await get_current_user(request)
-    rows = await sb("GET", "analyses", params={"user_id": f"eq.{user['id']}", "select": "symbol,direction,confidence,timeframe,entry_price,tp_price,sl_price,created_at", "order": "created_at.desc", "limit": "50"})
+    plan, cfg = get_plan_config(user)
+    limit = cfg.get("history_limit") or 50
+    if limit == 0: limit = 50
+    rows = await sb("GET", "analyses", params={"user_id": f"eq.{user['id']}", "select": "symbol,direction,confidence,timeframe,entry_price,tp_price,sl_price,created_at", "order": "created_at.desc", "limit": str(limit)})
     return {"analyses": rows or []}
+
+@app.get("/v1/user/plan-config")
+async def plan_config(request: Request):
+    user = await get_current_user(request)
+    plan, cfg = get_plan_config(user)
+    return {"plan": plan, "config": cfg}
 
 @app.get("/v1/detect-country")
 async def detect_country_ep(request: Request):
@@ -259,4 +310,4 @@ async def detect_country_ep(request: Request):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "db": "supabase"}
+    return {"status": "ok", "db": "supabase", "version": "3.0"}
