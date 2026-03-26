@@ -41,15 +41,7 @@ app = FastAPI(title="ChartPulse AI API", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "chrome-extension://*",
-        "https://www.khartoumbar.com",
-        "http://www.khartoumbar.com",
-        "https://khartoumbar.com",
-        "http://khartoumbar.com",
-        "https://chartpulse.ai",
-        "http://localhost:*",
-    ],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
