@@ -2,6 +2,5 @@ fastapi
 uvicorn
 httpx
 python-jose[cryptography]
-passlib[bcrypt]
 email-validator
 stripe
