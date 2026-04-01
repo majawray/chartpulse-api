@@ -249,7 +249,7 @@ async def subscribe(req: SubscribeReq, request: Request):
     if not STRIPE_SECRET: raise HTTPException(500, "Payments not configured")
     import stripe
     stripe.api_key = STRIPE_SECRET
-    session = stripe.checkout.Session.create(payment_method_types=["card"], line_items=[{"price_data": {"currency": "usd", "product_data": {"name": f"ChartPulse AI — {plan['name']}"}, "unit_amount": plan["price_cents"]}, "quantity": 1}], mode="payment", success_url="http://www.khartoumbar.com/success.html", cancel_url="http://www.khartoumbar.com/dashboard.html", metadata={"user_email": user["email"], "plan_name": plan["name"], "months": str(plan["months"]), "daily_limit": str(plan["daily_limit"])})
+    session = stripe.checkout.Session.create(payment_method_types=["card"], line_items=[{"price_data": {"currency": "usd", "product_data": {"name": f"ChartPulse AI — {plan['name']}"}, "unit_amount": plan["price_cents"]}, "quantity": 1}], mode="payment", success_url="https://www.chartpulse.world/success.html", cancel_url="https://www.chartpulse.world/dashboard.html", metadata={"user_email": user["email"], "plan_name": plan["name"], "months": str(plan["months"]), "daily_limit": str(plan["daily_limit"])})
     return {"checkout_url": session.url}
 
 @app.post("/v1/stripe/webhook")
