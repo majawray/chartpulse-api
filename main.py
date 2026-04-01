@@ -123,7 +123,7 @@ async def login(req: LoginReq):
     user = rows[0]
     plan, cfg = get_plan_config(user)
     signals_left = await calc_signals_left(user, plan, cfg)
-    return {"token": create_token(user["id"]), "user": {"id": user["id"], "email": user["email"], "plan": plan, "signals_left": signals_left, "plan_config": cfg}}
+    return {"token": create_token(user["id"]), "user": {"id": user["id"], "email": user["email"], "phone": user.get("phone",""), "country": user.get("country",""), "created_at": user.get("created_at",""), "plan": plan, "signals_left": signals_left, "plan_config": cfg}}
 
 async def calc_signals_left(user, plan, cfg):
     all_analyses = await sb("GET", "analyses", params={"user_id": f"eq.{user['id']}", "select": "id,created_at"})
@@ -286,7 +286,7 @@ async def stats(request: Request):
             if ed < datetime.utcnow(): plan, es = "Free", "Expired"; await sb("PATCH", "users", {"plan": "Free", "daily_limit": 3}, params={"id": f"eq.{user['id']}"})
             else: es = ed.strftime("%b %d, %Y")
         except: pass
-    return {"plan": plan, "signals_left": signals_left, "total_analyses": total, "expires": es, "plan_config": cfg}
+    return {"plan": plan, "signals_left": signals_left, "total_analyses": total, "expires": es, "plan_config": cfg, "email": user.get("email",""), "phone": user.get("phone",""), "country": user.get("country",""), "created_at": user.get("created_at","")}
 
 @app.get("/v1/user/history")
 async def history(request: Request):
